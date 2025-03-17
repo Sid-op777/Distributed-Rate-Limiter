@@ -12,6 +12,7 @@ public class RedisConfig {
 
     @Bean
     public RedisConnectionFactory redisConnectionFactory() {
+        // non-blocking, high-performance Redis client used by Spring
         return new LettuceConnectionFactory();
     }
 

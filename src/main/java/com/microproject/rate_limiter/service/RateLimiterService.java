@@ -1,44 +1,57 @@
 package com.microproject.rate_limiter.service;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.microproject.rate_limiter.RateLimitResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
+import java.time.Instant;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
+//uses sliding window count to rate limit
 @Service
 public class RateLimiterService {
 
-    private static final Logger logger = LoggerFactory.getLogger(RateLimiterService.class);
-
     private final RedisTemplate<String, String> redisTemplate;
-    private static final int REQUEST_LIMIT = 5; // Max 5 requests per minute
-    private static final Duration TIME_WINDOW = Duration.ofMinutes(1);
+    private final RateLimitEventPublisher eventPublisher;
 
-    public RateLimiterService(RedisTemplate<String, String> redisTemplate) {
+    private static final int REQUEST_LIMIT = 5; // Max 5 requests per minute
+    private static final int TIME_WINDOW_SECONDS = 60; // 1-minute window
+
+    @Autowired
+    public RateLimiterService(RedisTemplate<String, String> redisTemplate, RateLimitEventPublisher eventPublisher) {
         this.redisTemplate = redisTemplate;
+        this.eventPublisher = eventPublisher;
     }
 
-    public boolean isAllowed(String clientId) {
+    public RateLimitResponse isAllowed(String clientId) {
         String key = "ratelimit:" + clientId;
-        ValueOperations<String, String> operations = redisTemplate.opsForValue();
+        long now = Instant.now().getEpochSecond(); // Current timestamp in seconds
 
-        // Get current request count
-        String requestCount = operations.get(key);
-        int currentCount = (requestCount != null) ? Integer.parseInt(requestCount) : 0;
+        // Remove outdated timestamps
+        redisTemplate.opsForZSet().removeRangeByScore(key, 0, now - TIME_WINDOW_SECONDS);
 
-//        logger.info("Client: {} - Current Requests: {}", clientId, currentCount);
+        // Get the current request count
+        Long requestCount = redisTemplate.opsForZSet().size(key);
 
-        if (currentCount < REQUEST_LIMIT) {
-            operations.increment(key);
-            redisTemplate.expire(key, TIME_WINDOW);
-            logger.info("Client: {} - Request allowed ✅ - New Count: {}", clientId, currentCount + 1);
-            return true;
-        } else {
-            logger.warn("Client: {} - Rate limit exceeded ❌", clientId);
-            return false;
+        // Calculate remaining requests
+        long remainingRequests = (requestCount == null) ? REQUEST_LIMIT : Math.max(0, REQUEST_LIMIT - requestCount);
+
+        // Get the next reset time (oldest request + TIME_WINDOW_SECONDS)
+        Set<String> timestamps = redisTemplate.opsForZSet().range(key, 0, 0);
+        long resetTime = (timestamps == null || timestamps.isEmpty()) ? now + TIME_WINDOW_SECONDS
+                : Long.parseLong(timestamps.iterator().next()) + TIME_WINDOW_SECONDS;
+
+        boolean allowed = requestCount != null && requestCount < REQUEST_LIMIT;
+
+        if (allowed) {
+            redisTemplate.opsForZSet().add(key, String.valueOf(now), now);
+            redisTemplate.expire(key, TIME_WINDOW_SECONDS, TimeUnit.SECONDS);
         }
+
+        eventPublisher.sendRateLimitEvent(clientId, allowed); // Send event to RabbitMQ
+        return new RateLimitResponse(allowed, remainingRequests - (allowed ? 1 : 0), resetTime);
     }
 }
